@@ -1,0 +1,34 @@
+# ServerAgent Monitor - Agent Configuration
+# Copy this file to /etc/serveragent/config.yaml and configure accordingly
+
+# Central server URL (no trailing slash)
+server_url: "https://your-central-server.com"
+
+# Agent token — get this from the web dashboard under Servers
+agent_token: "REPLACE_WITH_YOUR_AGENT_TOKEN"
+
+# Collection interval in seconds (minimum: 15)
+interval: 30
+
+# Log file for the agent process itself
+log_file: "/var/log/serveragent.log"
+
+# State file to track history positions between restarts
+history_state_file: "/var/lib/serveragent/history_state.json"
+
+# Log sources for sudo and SSH login detection
+audit_log_sources:
+  - "/var/log/auth.log"       # Debian/Ubuntu
+  - "/var/log/secure"         # RHEL/CentOS
+
+# SSL certificate verification (set to false only for self-signed certs in dev)
+ssl_verify: true
+
+# HTTP request timeout in seconds
+timeout: 10
+
+# Max commands per API batch
+batch_size: 100
+
+# Enable debug logging
+debug: false
