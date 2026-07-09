@@ -153,6 +153,18 @@ if ! grep -q "_sa_capture" "$ROOT_BASHRC" 2>/dev/null; then
     log "Hook ditambahkan ke $ROOT_BASHRC"
 fi
 
+# Pasang juga ke /etc/bash.bashrc — file ini di-source bash untuk SEMUA shell
+# interaktif (login MAUPUN non-login), beda dengan /etc/profile.d yang cuma
+# untuk login shell. Ini menangkap kasus `su user` (tanpa '-') yang sebelumnya lolos.
+SYS_BASHRC="/etc/bash.bashrc"
+[[ -f "$SYS_BASHRC" ]] || SYS_BASHRC="/etc/bashrc"   # RHEL/CentOS pakai nama ini
+if [[ -f "$SYS_BASHRC" ]] && ! grep -q "_sa_capture" "$SYS_BASHRC" 2>/dev/null; then
+    echo "" >> "$SYS_BASHRC"
+    echo "# ServerAgent hook — tangkap command dari su tanpa '-' (non-login interaktif)" >> "$SYS_BASHRC"
+    echo "[ -f $HOOK_FILE ] && source $HOOK_FILE" >> "$SYS_BASHRC"
+    log "Hook ditambahkan ke $SYS_BASHRC"
+fi
+
 # ── Set permission log file ──────────────────────────────────────────────────
 touch "$CMD_LOG"
 chmod 622 "$CMD_LOG"          # semua user bisa tulis, agent bisa baca
@@ -202,23 +214,40 @@ EOF
 chmod 440 "$SUDOERS_FILE"
 log "Sudoers kill diset: $SUDOERS_FILE"
 
-# ── Auditd rules (opsional, backup capture) ──────────────────────────────────
-if command -v auditctl &>/dev/null; then
-    cat > /etc/audit/rules.d/serveragent.rules <<'AUDIT'
-# ServerAgent: tangkap semua eksekusi proses
--a always,exit -F arch=b64 -S execve -k cmd_exec
--a always,exit -F arch=b32 -S execve -k cmd_exec
-AUDIT
-    systemctl restart auditd 2>/dev/null || service auditd restart 2>/dev/null || true
-    log "Auditd rules dipasang"
-fi
-
-# ── Deteksi environment (LXC tidak support semua fitur systemd) ──────────────
+# ── Deteksi environment (LXC tidak support semua fitur systemd, dan TIDAK
+#    bisa menjalankan auditd sama sekali — kernel audit netlink socket
+#    tidak diekspos ke container unprivileged) ──────────────────────────────
 IS_LXC=false
 if systemd-detect-virt 2>/dev/null | grep -qi "lxc"; then
     IS_LXC=true
 elif grep -qa "container=lxc" /proc/1/environ 2>/dev/null; then
     IS_LXC=true
+fi
+
+# ── Auditd rules (sumber terbaik untuk menangkap SEMUA user — shell non-bash,
+#    sesi SSH non-interaktif, `su user` tanpa '-' — karena bekerja di level
+#    kernel execve, bukan lewat shell). DILEWATI di LXC: auditd dipastikan
+#    gagal start di container unprivileged Proxmox (Connection refused saat
+#    bicara ke netlink audit), jadi capture di LXC mengandalkan bash hook saja.
+if [[ "$IS_LXC" == "true" ]]; then
+    info "LXC terdeteksi — auditd dilewati (tidak didukung di container unprivileged)."
+    info "Command capture mengandalkan bash hook (/etc/profile.d + /etc/bash.bashrc)."
+elif ! command -v auditctl &>/dev/null; then
+    warn "auditctl tidak ditemukan — install paket auditd/audit gagal?"
+    warn "Command dari shell non-bash / sesi SSH non-interaktif TIDAK akan tertangkap."
+else
+    cat > /etc/audit/rules.d/serveragent.rules <<'AUDIT'
+# ServerAgent: tangkap semua eksekusi proses
+-a always,exit -F arch=b64 -S execve -k cmd_exec
+-a always,exit -F arch=b32 -S execve -k cmd_exec
+AUDIT
+    systemctl enable auditd 2>/dev/null || true
+    systemctl restart auditd 2>/dev/null || service auditd restart 2>/dev/null || true
+    if systemctl is-active --quiet auditd 2>/dev/null; then
+        log "Auditd rules dipasang & service aktif"
+    else
+        warn "Auditd rules ditulis tapi service tidak aktif — cek: journalctl -u auditd"
+    fi
 fi
 
 if [[ "$IS_LXC" == "true" ]]; then

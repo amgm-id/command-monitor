@@ -217,43 +217,102 @@ def collect_from_sudo_log(state: Dict, sources: List[str]) -> List[Dict]:
     return commands
 
 
+_AUDIT_MSG_RE = re.compile(r"msg=audit\(([^)]+)\)\s*:")
+_AUDIT_AUID_RE = re.compile(r"\bauid=(\S+)")
+_AUDIT_UID_RE = re.compile(r"\buid=(\S+)")
+_AUDIT_SUCCESS_RE = re.compile(r"\bsuccess=(\S+)")
+_AUDIT_ARG_RE = re.compile(r'\ba(\d+)(?:_len)?=(?:"([^"]*)"|(\S+))')
+
+
+def _parse_audit_timestamp(header_line: str) -> str:
+    """
+    Timestamp di header 'msg=audit(...)': epoch ('1728298981.123:456') pada mode
+    mentah, tapi berubah jadi tanggal ('10/07/2026 14:23:01.123:456') saat pakai
+    -i (interpreted) pada sebagian versi ausearch. Coba dua-duanya.
+    """
+    m = _AUDIT_MSG_RE.search(header_line)
+    if not m:
+        return utc_now()
+    raw = m.group(1).rsplit(":", 1)[0]  # buang ":serial" di akhir
+    try:
+        return datetime.fromtimestamp(float(raw)).isoformat()
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(raw, "%m/%d/%Y %H:%M:%S.%f").isoformat()
+    except ValueError:
+        pass
+    return utc_now()
+
+
 def collect_from_auditd(state: Dict) -> List[Dict]:
-    """Backup: gunakan ausearch jika auditd tersedia."""
+    """
+    Sumber independen dari shell/tipe sesi: baca execve() langsung dari kernel
+    audit log via ausearch. Menangkap command dari SEMUA user, termasuk shell
+    non-bash, sesi SSH non-interaktif, dan `su user` tanpa login shell — kasus
+    yang tidak bisa ditangkap oleh hook.sh (PROMPT_COMMAND).
+    """
     if not os.path.exists("/sbin/ausearch") and not os.path.exists("/usr/sbin/ausearch"):
         return []
 
     since_ts = state.get("ausearch_since", "")
-    since_arg = f"--start {since_ts}" if since_ts else "--start today"
+    since_arg = f"--start {since_ts}" if since_ts else "--start recent"
 
-    output = run_cmd(
-        f"ausearch -k cmd_exec {since_arg} -i --format csv 2>/dev/null | tail -200",
-        timeout=10,
-    )
+    # -i: interpretasi uid/auid jadi username dan decode argumen hex.
+    # Simpan checkpoint SEBELUM query berjalan agar event yang terjadi selama
+    # query berlangsung tidak pernah terlewat (overlap ditangani oleh dedup di main()).
+    checkpoint = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+    output = run_cmd(f"ausearch -k cmd_exec -i {since_arg} 2>/dev/null | tail -4000", timeout=15)
+    state["ausearch_since"] = checkpoint
     if not output:
         return []
 
     commands = []
-    now = utc_now()
-    for line in output.splitlines():
-        parts = line.split(",")
-        if len(parts) < 6:
+    for event in output.split("----"):
+        if not event.strip():
             continue
-        try:
-            cmd = parts[5].strip().strip('"')
-            username = parts[3].strip().strip('"') if len(parts) > 3 else "unknown"
-            if cmd and username and cmd != "exe":
-                commands.append({
-                    "username": username,
-                    "command": cmd,
-                    "timestamp": now,
-                    "remote_ip": None, "terminal": None,
-                    "working_dir": None, "exit_code": None,
-                })
-        except Exception:
-            pass
+        lines = event.splitlines()
+        syscall_line = next((l for l in lines if l.startswith("type=SYSCALL")), None)
+        execve_lines = [l for l in lines if l.startswith("type=EXECVE")]
+        if not syscall_line or not execve_lines:
+            continue
 
-    # Simpan timestamp untuk query berikutnya
-    state["ausearch_since"] = datetime.now().strftime("%H:%M:%S")
+        timestamp = _parse_audit_timestamp(syscall_line)
+
+        # auid = user login asli (tidak berubah oleh su/sudo), lebih akurat dari uid efektif.
+        m_auid = _AUDIT_AUID_RE.search(syscall_line)
+        m_uid = _AUDIT_UID_RE.search(syscall_line)
+        username = None
+        if m_auid and m_auid.group(1) not in ("unset", "4294967295"):
+            username = m_auid.group(1)
+        elif m_uid:
+            username = m_uid.group(1)
+        if not username:
+            continue
+
+        m_success = _AUDIT_SUCCESS_RE.search(syscall_line)
+        exit_code = 0 if (m_success and m_success.group(1) == "yes") else 1
+
+        args: Dict[int, str] = {}
+        for line in execve_lines:
+            for m in _AUDIT_ARG_RE.finditer(line):
+                idx = int(m.group(1))
+                if idx not in args:
+                    args[idx] = m.group(2) if m.group(2) is not None else m.group(3)
+        if not args:
+            continue
+        cmd = " ".join(args[i] for i in sorted(args))
+        if not cmd.strip():
+            continue
+
+        commands.append({
+            "username": username,
+            "command": cmd,
+            "timestamp": timestamp,
+            "remote_ip": None, "terminal": None,
+            "working_dir": None, "exit_code": exit_code,
+        })
+
     if commands:
         logger.info(f"Dari auditd: {len(commands)} command baru")
     return commands
@@ -570,6 +629,18 @@ def main():
     logger.info(f"ServerAgent v1.1 — server: {cfg['server_url']} | interval: {interval}s")
     logger.info(f"Hostname: {get_hostname()} | IP: {get_ip()}")
     logger.info(f"Command log: {cfg['command_log']}")
+
+    has_ausearch = os.path.exists("/sbin/ausearch") or os.path.exists("/usr/sbin/ausearch")
+    auditd_active = has_ausearch and run_cmd("systemctl is-active auditd 2>/dev/null").strip() == "active"
+    if not auditd_active:
+        reason = "ausearch tidak ditemukan" if not has_ausearch else "service auditd tidak aktif"
+        logger.warning(
+            f"Auditd tidak tersedia ({reason}) — command hanya ditangkap via bash hook "
+            "(PROMPT_COMMAND), yang TIDAK menangkap: shell non-bash (zsh/sh/fish), "
+            "sesi SSH non-interaktif (ssh host 'cmd'), dan su tanpa '-'. "
+            "Catatan: auditd memang TIDAK BISA jalan di LXC unprivileged (Proxmox) — "
+            "kernel audit netlink socket tidak diekspos ke container. Di situ ini normal."
+        )
 
     # Pastikan command log directory ada
     log_dir = os.path.dirname(cfg["command_log"])

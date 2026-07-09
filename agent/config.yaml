@@ -2,7 +2,7 @@
 # Copy this file to /etc/serveragent/config.yaml and configure accordingly
 
 # Central server URL (no trailing slash)
-server_url: "https://your-central-server.com"
+server_url: "http://ssh.it.ptamgm.net:8888"
 
 # Agent token — get this from the web dashboard under Servers
 agent_token: "REPLACE_WITH_YOUR_AGENT_TOKEN"

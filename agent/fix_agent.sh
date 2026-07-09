@@ -82,6 +82,54 @@ if ! grep -q "_sa_capture" /root/.bashrc 2>/dev/null; then
     log ".bashrc root diupdate"
 fi
 
+# Pasang juga ke /etc/bash.bashrc — di-source untuk SEMUA shell interaktif bash
+# (login maupun non-login), beda dengan /etc/profile.d yang cuma untuk login shell.
+# Ini menangkap kasus `su user` (tanpa '-') yang sebelumnya lolos dari capture.
+SYS_BASHRC="/etc/bash.bashrc"
+[[ -f "$SYS_BASHRC" ]] || SYS_BASHRC="/etc/bashrc"
+if [[ -f "$SYS_BASHRC" ]] && ! grep -q "_sa_capture" "$SYS_BASHRC" 2>/dev/null; then
+    echo "" >> "$SYS_BASHRC"
+    echo "# ServerAgent hook — tangkap command dari su tanpa '-' (non-login interaktif)" >> "$SYS_BASHRC"
+    echo "[ -f $HOOK_FILE ] && source $HOOK_FILE" >> "$SYS_BASHRC"
+    log "Hook ditambahkan ke $SYS_BASHRC"
+fi
+
+# Step 2b: Pasang auditd (sumber terbaik untuk SEMUA user, tapi DILEWATI di LXC —
+# auditd dipastikan gagal start di container unprivileged Proxmox: "Connection
+# refused" saat bicara ke netlink audit kernel, apapun konfigurasinya. Di situ
+# capture cukup mengandalkan bash hook di atas.)
+IS_LXC=false
+if systemd-detect-virt 2>/dev/null | grep -qi "lxc"; then
+    IS_LXC=true
+elif grep -qa "container=lxc" /proc/1/environ 2>/dev/null; then
+    IS_LXC=true
+fi
+
+if [[ "$IS_LXC" == "true" ]]; then
+    info "LXC terdeteksi — auditd dilewati (tidak didukung di container unprivileged)"
+else
+    info "Memasang auditd..."
+    if ! command -v auditctl &>/dev/null; then
+        apt-get install -y auditd 2>/dev/null || yum install -y audit 2>/dev/null || dnf install -y audit 2>/dev/null || true
+    fi
+    if command -v auditctl &>/dev/null; then
+        cat > /etc/audit/rules.d/serveragent.rules <<'AUDIT'
+# ServerAgent: tangkap semua eksekusi proses
+-a always,exit -F arch=b64 -S execve -k cmd_exec
+-a always,exit -F arch=b32 -S execve -k cmd_exec
+AUDIT
+        systemctl enable auditd 2>/dev/null || true
+        systemctl restart auditd 2>/dev/null || service auditd restart 2>/dev/null || true
+        if systemctl is-active --quiet auditd 2>/dev/null; then
+            log "Auditd rules dipasang & service aktif"
+        else
+            warn "Auditd rules ditulis tapi service tidak aktif — cek: journalctl -u auditd"
+        fi
+    else
+        warn "auditctl tidak ditemukan — command dari shell non-bash / sesi SSH non-interaktif TIDAK akan tertangkap"
+    fi
+fi
+
 # Step 3: Update agent.py
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/agent.py" && -d "$INSTALL_DIR" ]]; then
