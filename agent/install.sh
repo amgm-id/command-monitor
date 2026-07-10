@@ -250,12 +250,17 @@ AUDIT
     fi
 fi
 
+# CATATAN: NoNewPrivileges SENGAJA TIDAK dipasang — fitur "Kill Session" dari
+# dashboard bergantung pada `sudo` (lewat wrapper sa-kill-session) untuk bisa
+# menghentikan proses milik user lain, dan NoNewPrivileges memblokir sudo
+# sepenuhnya (setuid tidak bisa jalan). Batasan keamanannya sudah ditegakkan
+# lewat sudoers NOPASSWD yang di-scope hanya ke satu wrapper (lihat di bawah),
+# bukan lewat NoNewPrivileges.
 if [[ "$IS_LXC" == "true" ]]; then
     info "LXC container terdeteksi — menggunakan service tanpa namespace hardening"
-    SECURITY_OPTS="NoNewPrivileges=yes"
+    SECURITY_OPTS=""
 else
-    SECURITY_OPTS="NoNewPrivileges=yes
-PrivateTmp=yes
+    SECURITY_OPTS="PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=${STATE_DIR} ${CMD_LOG_DIR}
 ReadOnlyPaths=/var/log /etc /home /root ${INSTALL_DIR}"

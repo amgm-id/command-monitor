@@ -201,6 +201,18 @@ else
     rm -f "$SUDOERS_FILE"
 fi
 
+# Step 3b: Lepas NoNewPrivileges dari unit systemd yang sudah ter-deploy —
+# opsi ini memblokir sudo total (dibutuhkan wrapper kill-session). Batasan
+# keamanan kill-session sudah ditegakkan lewat sudoers NOPASSWD yang di-scope
+# ke satu wrapper saja, bukan lewat NoNewPrivileges.
+UNIT_FILE="/etc/systemd/system/${SERVICE}.service"
+if [[ -f "$UNIT_FILE" ]] && grep -q "^NoNewPrivileges=yes" "$UNIT_FILE"; then
+    info "Melepas NoNewPrivileges dari $UNIT_FILE (blokir sudo untuk kill-session)..."
+    sed -i '/^NoNewPrivileges=yes/d' "$UNIT_FILE"
+    systemctl daemon-reload
+    log "Unit systemd diperbarui"
+fi
+
 # Step 4: Reset state (agar agent baca dari awal)
 STATE="/var/lib/serveragent/state.json"
 if [[ -f "$STATE" ]]; then
