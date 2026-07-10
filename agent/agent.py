@@ -465,7 +465,7 @@ def execute_kill_session(payload: Dict) -> tuple:
     # ── Fallback: coba langsung (jika agent dijalankan sebagai root) ──────────
     if terminal:
         # Kumpulkan semua PID di terminal lalu kill sekaligus
-        ps_out, _, _ = _run(f"ps -t {terminal} -o pid= 2>/dev/null")
+        _, ps_out, _ = _run(f"ps -t {terminal} -o pid= 2>/dev/null")
         pids = [p.strip() for p in ps_out.splitlines() if p.strip().isdigit()]
         if pids:
             rc, out, err = _run(f"kill -9 {' '.join(pids)}")
@@ -501,11 +501,15 @@ def process_actions(client) -> None:
 
         logger.info(f"Aksi #{action_id}: {action_type} payload={payload}")
 
-        if action_type == "kill_session":
-            success, msg = execute_kill_session(payload)
-            client.report_action_result(action_id, msg, success)
-        else:
-            client.report_action_result(action_id, f"Aksi tidak dikenal: {action_type}", False)
+        try:
+            if action_type == "kill_session":
+                success, msg = execute_kill_session(payload)
+                client.report_action_result(action_id, msg, success)
+            else:
+                client.report_action_result(action_id, f"Aksi tidak dikenal: {action_type}", False)
+        except Exception as e:
+            logger.error(f"Aksi #{action_id} error tak terduga: {e}", exc_info=True)
+            client.report_action_result(action_id, f"Error internal agent: {e}", False)
 
 
 # ── API Client ────────────────────────────────────────────────────────────────
@@ -583,17 +587,18 @@ class AgentClient:
             logger.debug(f"Cek aksi gagal: {e}")
         return []
 
-    def report_action_result(self, action_id: int, result: str, success: bool = True):
-        try:
-            requests.post(
-                f"{self.url}/api/agent/actions/{action_id}/result",
-                json={"result": result, "success": success},
-                headers=self.headers,
-                verify=self.ssl_verify,
-                timeout=self.timeout,
-            )
-        except Exception as e:
-            logger.debug(f"Lapor hasil aksi gagal: {e}")
+    def report_action_result(self, action_id: int, result: str, success: bool = True) -> bool:
+        """
+        Pakai _post() (bukan requests.post mentah) supaya kegagalan kirim
+        benar-benar terlihat di log (warning/error), bukan ditelan diam-diam
+        di level debug. Kalau ini gagal, action tetap berstatus PENDING di
+        server pusat dan akan dieksekusi ulang setiap siklus — retry itu
+        sendiri benar, tapi harus terlihat di log agar bukan misteri.
+        """
+        ok = self._post(f"/agent/actions/{action_id}/result", {"result": result, "success": success})
+        if not ok:
+            logger.warning(f"Gagal lapor hasil aksi #{action_id} — action akan dicoba ulang siklus berikutnya")
+        return ok
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
