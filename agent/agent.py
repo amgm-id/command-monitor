@@ -219,7 +219,6 @@ def collect_from_sudo_log(state: Dict, sources: List[str]) -> List[Dict]:
 
 _AUDIT_MSG_RE = re.compile(r"msg=audit\(([^)]+)\)\s*:")
 _AUDIT_AUID_RE = re.compile(r"\bauid=(\S+)")
-_AUDIT_UID_RE = re.compile(r"\buid=(\S+)")
 _AUDIT_SUCCESS_RE = re.compile(r"\bsuccess=(\S+)")
 _AUDIT_ARG_RE = re.compile(r'\ba(\d+)(?:_len)?=(?:"([^"]*)"|(\S+))')
 
@@ -279,16 +278,17 @@ def collect_from_auditd(state: Dict) -> List[Dict]:
 
         timestamp = _parse_audit_timestamp(syscall_line)
 
-        # auid = user login asli (tidak berubah oleh su/sudo), lebih akurat dari uid efektif.
+        # auid = user login asli (tidak berubah oleh su/sudo). Kalau auid tidak
+        # ada/"unset", proses ini BUKAN dari sesi login user — melainkan proses
+        # sistem/service (systemd, cron, Docker/containerd, agent ini sendiri).
+        # Skip sepenuhnya, jangan fallback ke uid efektif — itu yang sebelumnya
+        # menyebabkan noise seperti "serveragent" (proses agent sendiri) dan
+        # "unknown(100000)" (uid Docker userns-remap) ikut tercatat sebagai
+        # kalau-kalau itu perintah user.
         m_auid = _AUDIT_AUID_RE.search(syscall_line)
-        m_uid = _AUDIT_UID_RE.search(syscall_line)
-        username = None
-        if m_auid and m_auid.group(1) not in ("unset", "4294967295"):
-            username = m_auid.group(1)
-        elif m_uid:
-            username = m_uid.group(1)
-        if not username:
+        if not m_auid or m_auid.group(1) in ("unset", "4294967295"):
             continue
+        username = m_auid.group(1)
 
         m_success = _AUDIT_SUCCESS_RE.search(syscall_line)
         exit_code = 0 if (m_success and m_success.group(1) == "yes") else 1
