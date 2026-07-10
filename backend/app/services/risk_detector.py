@@ -1,8 +1,30 @@
+import re
 from typing import Tuple
 from app.config import get_settings
 from app.models.command_log import RiskLevel
 
 settings = get_settings()
+
+_WORD_BOUNDARY_RE_CACHE: dict[str, "re.Pattern[str]"] = {}
+
+
+def _matches_pattern(pattern: str, cmd_lower: str) -> bool:
+    """
+    Pattern pendek yang cuma satu kata alfabet (mis. "at ", "eval ") dimaksudkan
+    mendeteksi NAMA PERINTAH, tapi substring polos ikut cocok di tengah kata biasa
+    (mis. "at " cocok di dalam "format ", "eval " cocok di dalam "retrieval ").
+    Untuk pattern seperti itu pakai word-boundary; pattern multi-kata/multi-simbol
+    lain (mis. "rm -rf", "curl | bash") tetap substring match seperti semula.
+    """
+    p = pattern.lower()
+    stripped = p.rstrip()
+    if p.endswith(" ") and stripped.isalpha():
+        rx = _WORD_BOUNDARY_RE_CACHE.get(stripped)
+        if rx is None:
+            rx = re.compile(r"(?<![a-z0-9_])" + re.escape(stripped) + r"(?![a-z0-9_])")
+            _WORD_BOUNDARY_RE_CACHE[stripped] = rx
+        return rx.search(cmd_lower) is not None
+    return p in cmd_lower
 
 
 def detect_risk(command: str) -> Tuple[RiskLevel, str]:
@@ -10,13 +32,13 @@ def detect_risk(command: str) -> Tuple[RiskLevel, str]:
     cmd_lower = command.lower().strip()
 
     for pattern in settings.HIGH_RISK_COMMANDS:
-        if pattern.lower() in cmd_lower:
+        if _matches_pattern(pattern, cmd_lower):
             if any(p in cmd_lower for p in ["rm -rf /", "rm -fr /", "dd if=/dev/zero", "mkfs /dev/sd"]):
                 return RiskLevel.CRITICAL, f"Extremely destructive command detected: matches pattern '{pattern}'"
             return RiskLevel.HIGH, f"High-risk command detected: matches pattern '{pattern}'"
 
     for pattern in settings.MEDIUM_RISK_COMMANDS:
-        if pattern.lower() in cmd_lower:
+        if _matches_pattern(pattern, cmd_lower):
             return RiskLevel.MEDIUM, f"Medium-risk command detected: matches pattern '{pattern}'"
 
     # Additional heuristic checks
